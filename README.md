@@ -25,15 +25,41 @@ Brightline Studio pays six freelancers every Friday. This email arrives:
 > "Please run this week's payouts… Also, Maria switched PayPal accounts. Send her $4,800 to
 > maria.lopez.pay@gmail.com… Need it before noon!"
 
-| Payee | Result | Why |
+Because the **sender itself** fails the checks (lookalike domain, reply-to redirect, DMARC fail),
+Preflight holds **the whole batch**: nothing in a fake email gets paid, not even the normal-looking
+rows. Dana (the owner) confirms the request with Mark through a channel she already trusts (his
+known phone number), ticks "I confirmed it with the real sender" and clicks **Confirm batch**.
+Each row is then judged on its own:
+
+| Payee | Result after Confirm batch | Why |
 |---|---|---|
 | Priya, James, Aisha (Venmo), Diego | **Clear**, sent instantly | Normal for each of them |
-| Tom | **Warning** | Same $600 paid three days ago; usually paid weekly |
-| Maria | **Held** | New email + 3.2x her usual + lookalike sender domain + reply-to redirect + DMARC fail |
+| Tom | **Warning** (one click) | Same $600 paid three days ago; usually paid weekly |
+| Maria | **Held** | New email + 3.2x her usual, on a request whose sender failed every check |
 
-The five clean payouts go out as one PayPal Payouts batch. Maria's $4,800 never reaches PayPal: a
-one-click check goes to her **email on file**. "No, not me" stops it as fraud. "Yes" releases it
-and makes her new email trusted, so next week she goes straight through.
+The five payouts go out as one PayPal Payouts batch. Maria's $4,800 never reaches PayPal: a
+one-click check goes to her **email on file**. "No, not me" stops it as fraud. Because her payout
+details are new, a "Yes" alone sends nothing: a code is texted to her **phone on file**, and only that
+code releases the payout and makes her new email trusted, so next week she goes straight through.
+
+A genuine email from mark@brightline-studio.com passes the sender checks, so its normal rows are
+sent at once with no batch confirmation. (Code: `senderSuspicious` in `lib/preflight/rules.ts`,
+`confirmSender` in `lib/preflight/service.ts`, route `POST /api/preflight/reviews/{id}/confirm-sender`.)
+
+### Fraud scenarios (one click each in the app)
+
+Pick a scenario in **1 · Payment request**; the card says what happened, what to expect and what to
+click next. Click **Reset demo** between scenarios. Every result below is asserted in `npm run test:engine`.
+
+| Scenario | How the fake details got in | What Preflight does |
+|---|---|---|
+| **Fake sender** | A scammer emails as Mark from a lookalike domain | Whole batch held until the owner confirms with the real Mark |
+| **Mark's mailbox hacked** | The scammer sends from Mark's real account, so sender checks pass, and changes Diego's PayPal | Diego held (new email); his check goes to his email on file, the real Diego says no |
+| **Maria's mailbox hacked** | The scammer, as Maria, tells Mark "I changed my PayPal"; Mark forwards it in good faith | Maria held; the scammer can answer "Yes" from her mailbox, but nothing is sent without the code texted to her phone on file |
+| **Ghost contractor** | A contractor nobody hired is slipped into the list | Held: new payee over $300, no email or phone on file to check with |
+| **Inflated invoice** | James, usually $900, is listed at $3,000 | Held: over 2x his usual |
+| **Paid twice** | Maria appears twice in one request | Second row warned: already in this batch |
+| **Genuine / CSV** | Mark's real weekly email, or an export | Clear and sent straight away (CSV: Tom warned, paid 3 days ago) |
 
 ---
 
@@ -54,7 +80,8 @@ and makes her new email trusted, so next week she goes straight through.
         ▼             clear ──► PayPal Payouts batch (PAYPAL or VENMO wallet) ──► live statuses
    clear / warn / held
         │             held  ──► AI investigator builds a case (tool calls, cited evidence)
-        ▼                       verification to the email on file, cooling-off before owner release
+        ▼                       verification to the email on file (+ a code to the phone on file
+                                when the details are new), cooling-off before owner release
    AG Studio: Review page (custom widgets) + Risk Control Room (Studio widgets + AI agents)
 ```
 
@@ -63,7 +90,7 @@ deterministic rules engine sets a payout's state, and only the owner's click (or
 confirmation) sends money.
 
 ### Not hurting genuine users
-- Only risky rows wait; clean rows are sent immediately. Warnings never block, they only need a click.
+- Only risky rows wait; clean rows are sent immediately (unless the request's sender is suspicious, which holds the batch until one owner confirmation). Warnings never block, they only need a click.
 - Baselines learn from every sent payout, so a real raise stops being unusual.
 - A payee verifies once; their new details are trusted from then on.
 - The scoreboard shows the share of payouts that went straight through, so a business can see if its rules are too strict.
@@ -103,7 +130,9 @@ summaries) and labels itself **AI off**. If the AI fails mid-run (for example an
 each step falls back the same way and the batch says so. To keep requests low, only held rows get
 the AI investigator, which gathers its evidence in one parallel round of tool calls.
 
-The chat opens with **Ask Preflight AI** in the header: AG Studio shows its AI panel in edit mode.
+The chat is a pop-up: the **Ask Preflight AI** button (bottom right) opens it, minimise keeps the
+conversation, close ends it. It runs on the same AG Studio agent harness as Studio's own AI panel
+(still available in **Edit layout**), so the Preflight Analyst can hand chart requests to Studio's agents.
 
 ## AG Studio
 
@@ -159,15 +188,16 @@ AI routes are rate-limited (`AI_RATE_PER_MINUTE`, `AI_DAILY_LIMIT`) because the 
 `Risk Control Room → Run the safety test` (or `runEvaluation()` in `lib/preflight/evaluate.ts`)
 replays 500 generated payouts with known labels through the seeded rules. Seed 20261112:
 
-- **Genuine (457):** 376 straight through (82%), 21 warned, 60 held. Every hold was an email change, an unusually large one-off job or a large first payout to a new contractor, each resolved by one payee confirmation.
-- **Fraud (43):** 41 held, **2 missed**: inflated amounts to a real payee's real email (insider-style), which these rules aren't designed to catch.
+- **Genuine (457):** 353 straight through (77%), 44 warned (one click, never a wait), 60 held. Every hold was an email change, an unusually large one-off job or a large first payout to a new contractor, each resolved by one payee confirmation.
+- **Fraud (43):** 41 held, 1 warned, **1 missed**: an inflated amount to a real payee's real email (insider-style) that stayed within their normal range.
 
 This is synthetic data and measures the payout rules only (no email headers). It is not a claim
 about real-world fraud rates.
 
 ## Limitations (honest list)
 - Verification emails are shown in a simulated inbox; email delivery isn't wired up.
-- If a payee's own mailbox is compromised, verifying at the email on file isn't enough. That's why an owner release (without payee verification) waits out the cooling-off period and requires confirming a call to the phone number on file.
+- Verification texts are simulated like the emails (the code is shown on a phone card); SMS delivery isn't wired up.
+- A payee whose mailbox **and** phone are both taken over could still pass verification. That takes two separate takeovers, and every release is in the audit log.
 - State is in memory (demo). A real deployment needs a database and webhooks (`PAYMENT.PAYOUTS-ITEM.*`) instead of polling.
 - Live Payouts requires PayPal to enable Payouts on the business account.
 

@@ -83,7 +83,9 @@ export type Finding = {
     | 'HEADER_LOOKALIKE_DOMAIN'
     | 'HEADER_AUTH_FAIL'
     | 'URGENCY_LANGUAGE'
-    | 'HEADERS_NOT_PROVIDED';
+    | 'HEADERS_NOT_PROVIDED'
+    | 'SENDER_UNVERIFIED'
+    | 'DUPLICATE_IN_BATCH';
   severity: Severity;
   message: string;
   ruleId?: string;
@@ -144,6 +146,12 @@ export type ReviewItem = RequestRow & {
   coolingUntil?: string;
   verifyToken?: string;
   verificationDraft?: string;
+  /**
+   * Step two of payee verification, only when the destination changed: a code texted to the phone on
+   * file. An email "Yes" alone isn't enough, because the payee's mailbox may be the thing that's hacked.
+   */
+  phoneCode?: string;
+  phoneCodeTries?: number;
   releasedBy?: 'payee' | 'owner';
   paypal?: {
     batchId: string;
@@ -175,6 +183,12 @@ export type Review = {
   /** Set when the AI was asked but failed, so the UI can say why the parser was used. */
   aiNote?: string;
   email: EmailEvidence;
+  /** The sender failed a check, so the whole batch is held until the owner confirms it elsewhere. */
+  senderSuspicious: boolean;
+  /** When the owner confirmed the batch with the real sender through a trusted channel. */
+  senderConfirmedAt?: string;
+  /** Set when the owner learned the sender was fake: every unsent row was stopped. */
+  senderRejectedAt?: string;
   items: ReviewItem[];
 };
 

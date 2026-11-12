@@ -97,11 +97,13 @@ function builtInFindings(row: RequestRow, ctx: Ctx, extractionVerified: boolean)
   } else {
     const b = baselineFor(ctx.history, payee.id);
     const z = outlierScore(b, row.amount);
-    // A statistical heads-up only: rules decide holds; this keeps genuine raises from being blocked.
+    // Far outside the payee's normal range: a warning (one click, never a hold) once the amount is at
+    // least 1.5x their usual, a note below that. Holds stay with the owner's rules, so a genuine
+    // raise is never blocked.
     if (z > 3.5) {
       out.push({
         code: 'AMOUNT_OUTLIER',
-        severity: 'info',
+        severity: row.amount >= b.median * 1.5 ? 'warn' : 'info',
         message: `Well outside ${payee.name.split(' ')[0]}'s normal range (${usd(b.min)}-${usd(b.max)} over ${b.count} payouts).`,
       });
     }
@@ -145,14 +147,38 @@ export function extractionVerified(row: RequestRow, source: string) {
   return amountOk && who;
 }
 
+/** A request whose sender fails a check is not a real instruction to pay anyone. */
+export const senderSuspicious = (email: EmailEvidence) =>
+  email.provided &&
+  (!!email.lookalikeOf ||
+    (!!email.replyToDomain && email.replyToDomain !== email.fromDomain) ||
+    email.auth?.dmarc === 'fail' || email.auth?.spf === 'fail' || email.auth?.dkim === 'fail');
+
+export const SENDER_HOLD: Finding = {
+  code: 'SENDER_UNVERIFIED',
+  severity: 'hold',
+  message: 'This request came from a suspicious sender, so nothing in it is paid until the batch is confirmed with the real sender through a channel you already trust.',
+};
+
+export const duplicateInBatch = (row: RequestRow, first: RequestRow): Finding => ({
+  code: 'DUPLICATE_IN_BATCH',
+  severity: 'warn',
+  message: `${row.name} is already in this batch (${usdText(first.amount)}). Check this isn't the same invoice twice, or one payout split in two.`,
+});
+
 export function evaluateItems(
   rows: RequestRow[],
-  opts: { rules: Rule[]; payees: Payee[]; history: PastPayout[]; email: EmailEvidence; source: string; now?: Date },
+  opts: {
+    rules: Rule[]; payees: Payee[]; history: PastPayout[]; email: EmailEvidence; source: string; now?: Date;
+    /** Set once the owner has confirmed the batch with the real sender: the batch-wide hold lifts. */
+    senderConfirmed?: boolean;
+  },
 ): ReviewItem[] {
   const now = opts.now ?? new Date();
   const ctx: Ctx = { payees: opts.payees, history: opts.history, now, batchTotal: rows.reduce((s, r) => s + r.amount, 0) };
   // Email-level signals apply to every row that changes destination, and are shown on the batch.
   const mailFindings = emailFindings(opts.email);
+  const seen = new Map<string, RequestRow>();
   return rows.map((row) => {
     const payee = matchPayee(row, opts.payees);
     const findings: Finding[] = [
@@ -163,6 +189,14 @@ export function evaluateItems(
     // email or an unknown payee. Elsewhere they would only add noise for genuine payouts.
     const changedDest = !payee || payee.email.toLowerCase() !== row.receiver.toLowerCase();
     if (changedDest) findings.push(...mailFindings);
+    // A fake sender makes the whole request untrusted: every row waits for the owner to confirm the
+    // batch with the real sender, even rows going to the right people.
+    if (senderSuspicious(opts.email) && !opts.senderConfirmed) findings.unshift(SENDER_HOLD);
+    // The same person twice in one request is the classic "invoice paid twice" (or split to stay under a limit).
+    const key = payee?.id ?? row.receiver.toLowerCase();
+    const first = seen.get(key);
+    if (first) findings.push(duplicateInBatch(row, first));
+    else seen.set(key, row);
 
     const state = findings.some((f) => f.severity === 'hold') ? 'held' : findings.some((f) => f.severity === 'warn') ? 'warn' : 'clear';
     return {

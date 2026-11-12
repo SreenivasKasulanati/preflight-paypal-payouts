@@ -61,3 +61,34 @@ body {
   --color-pp-danger: var(--pp-danger);
   --font-paypal: var(--pp-font);
 }
+
+/* AG Studio AI chat: Tailwind's reset removes list bullets and spacing, so the agent's answers lost
+   their structure. Restore readable markdown inside the assistant's messages only. */
+.ag-studio-ai-output-message-content ul { list-style: disc; padding-left: 1.25rem; margin: 0.25rem 0 0.5rem; }
+.ag-studio-ai-output-message-content ol { list-style: decimal; padding-left: 1.4rem; margin: 0.25rem 0 0.5rem; }
+.ag-studio-ai-output-message-content li { margin: 0.15rem 0; }
+.ag-studio-ai-output-message-content li::marker { color: var(--pp-blue); }
+.ag-studio-ai-output-message-content p { margin: 0.35rem 0; }
+.ag-studio-ai-output-message-content h1,
+.ag-studio-ai-output-message-content h2,
+.ag-studio-ai-output-message-content h3 { font-weight: 700; color: var(--pp-navy); margin: 0.6rem 0 0.2rem; font-size: 0.95rem; }
+.ag-studio-ai-output-message-content strong { color: var(--pp-navy); }
+.ag-studio-ai-output-message-content code { background: var(--pp-highlight); border-radius: 4px; padding: 0 3px; }
+
+/* Pop-up chat open animation (chat-popup.tsx). */
+@keyframes pf-pop { from { opacity: 0; transform: translateY(8px) scale(0.97); } to { opacity: 1; transform: none; } }
+
+/* Review grid (widgets.tsx): every cell centred vertically, status columns centred, amounts right. */
+.pf-cell-middle, .pf-cell-center, .pf-cell-end { display: flex !important; align-items: center; }
+.pf-cell-center { justify-content: center; }
+.pf-cell-end { justify-content: flex-end; }
+.pf-header-center .ag-header-cell-label { justify-content: center; }
+
+/*
+ * One base text size for the Preflight page, growing a little with the window: 16px on a
+ * 1536px-wide window, about 17.5px on 1850-1920px, capped at 18px. Every Tailwind size on the
+ * page is in rem, and AG Studio's own sizes follow it (app/preflight/fit.ts).
+ */
+html {
+  font-size: clamp(16px, calc(9px + 0.45vw), 18px);
+}

@@ -55,7 +55,9 @@ export function investigateWithRules(item: ReviewItem): Investigation {
         ? 'Several independent warning signs line up: treat this as a likely impersonation attempt.'
         : verdict === 'likely_genuine'
           ? 'Nothing beyond minor notes was found.'
-          : 'Some checks failed. Confirm with the payee before releasing.',
+          : item.findings.some((f) => f.severity === 'hold')
+            ? 'Some checks failed. Confirm with the payee before releasing.'
+            : 'A warning only: check it, then acknowledge it to send with the batch.',
     evidence: item.findings.map((f) => ({ source: 'rules engine', fact: f.message })),
     by: 'rules',
   };

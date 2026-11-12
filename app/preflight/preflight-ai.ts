@@ -8,7 +8,7 @@
 // Every agent talks to the model through the boilerplate's OpenAI adapter, which posts to this
 // app's /api/ai proxy, so the key stays on the server.
 
-import { createAiHarness, directLlmRunner, type AgAiHarnessSetup, type AgAiPromptStarter, type AgAiTool } from 'ag-studio';
+import { createAiHarness, directLlmRunner, type AgAiHarness, type AgAiHarnessSetup, type AgAiPromptStarter, type AgAiTool } from 'ag-studio';
 import { openaiAdapter } from '../dashboard/studio/openai-adapter';
 import { actions, currentReview, preflightStore } from './client-store';
 
@@ -40,6 +40,7 @@ function batchOverview() {
   return {
     source: review.source,
     sender: review.email.provided ? { from: review.email.from, replyTo: review.email.replyTo ?? null, lookalikeOf: review.email.lookalikeOf ?? null } : 'headers not provided',
+    batch_on_hold_for_suspicious_sender: review.senderSuspicious && !review.senderConfirmedAt,
     rows: review.items.map((i) => ({
       payee: i.name,
       amount: usd(i.amount),
@@ -68,15 +69,27 @@ function caseFor(payee: string) {
     baseline: item.baseline ? { usual: usd(item.baseline.median), range: `${usd(item.baseline.min)}-${usd(item.baseline.max)}`, payouts: item.baseline.count } : null,
     investigation: item.investigation ?? null,
     next_steps:
-      item.state === 'held'
-        ? 'Held. A confirmation went to the email on file; the owner can also release after the cooling-off period and a call to the number on file.'
+      item.state === 'held' && item.findings.every((f) => f.severity !== 'hold' || f.code === 'SENDER_UNVERIFIED')
+        ? 'Held only because the request came from a suspicious sender. The owner checks with the real sender by phone or in person (the red banner above the grid): if they did not send it, "Not from them: stop all" stops every payout in it; if they did, "Confirm batch" lifts the hold.'
+        : item.state === 'held'
+        ? 'Held. A confirmation went to the email on file; if the payout details are new, a Yes there also needs a code texted to the phone on file (in case the mailbox is hacked). The owner can also release after the cooling-off period and a call to the number on file. If the sender is also suspicious, the batch must be confirmed with the real sender too.'
         : item.state === 'warn'
           ? 'Sends with the batch once the owner acknowledges the warning.'
           : item.state,
   };
 }
 
-const PROMPT_STARTERS: AgAiPromptStarter[] = [
+// The live harness, kept so Preflight's own pop-up chat (chat-popup.tsx) can open threads on the
+// same agents Studio's side panel uses.
+let currentHarness: AgAiHarness | null = null;
+const harnessListeners = new Set<(h: AgAiHarness) => void>();
+export function onHarness(listener: (h: AgAiHarness) => void) {
+  if (currentHarness) listener(currentHarness);
+  harnessListeners.add(listener);
+  return () => harnessListeners.delete(listener);
+}
+
+export const PROMPT_STARTERS: AgAiPromptStarter[] = [
   { label: 'Why is Maria held?', prompt: "Why is Maria's payout held, and what should I do?" },
   { label: 'Summarise this batch', prompt: 'Summarise this batch: what is safe to send, what is held, and why.' },
   { label: 'Chart held dollars', prompt: 'Add a chart to the Risk Control Room showing held and stopped dollars by main reason.' },
@@ -112,8 +125,13 @@ export function buildPreflightAi(models: string[]): AgAiHarnessSetup {
     tool('run_safety_test', 'Replay 500 synthetic payouts (genuine and fraudulent) through the current rules and report friction and catch rate. Synthetic data.', {}, async () => actions.evaluate()),
   ];
 
-  return ({ api }) =>
-    createAiHarness(api, ({ builtIn, tools }) => ({
+  // One harness per Studio instance, shared by Studio's side panel and Preflight's pop-up chat.
+  // Studio only builds it when its own panel first opens, so the page also builds it on load
+  // (preflight-app.tsx, onApiReady) and Studio's later call gets the same one back.
+  let cached: { api: unknown; harness: AgAiHarness } | null = null;
+  return ({ api }) => {
+    if (cached?.api === api) return cached.harness;
+    const harness = createAiHarness(api, ({ builtIn, tools }) => ({
       agents: [
         directLlmRunner({
           id: 'preflight',
@@ -124,7 +142,12 @@ export function buildPreflightAi(models: string[]): AgAiHarnessSetup {
             'Use your tools for facts about the batch, cases and rules; never state an amount, email or status a tool did not return. ' +
             'You cannot send, release or stop money and must not say you did: the owner does that in the Payout review widget. ' +
             'Rules you propose stay unconfirmed until the owner confirms them. Keep answers short and plain. ' +
-            'For anything about building or changing dashboard widgets, charts or pages, delegate to the lead agent.',
+            'For anything about building or changing dashboard widgets, charts or pages, delegate to the lead agent.\n\n' +
+            'Format every answer about a payout or the batch in markdown like this:\n' +
+            '**Verdict:** one line with the state and the investigator verdict (for example "Held. Likely fraud.").\n' +
+            '### Why\n- 3 to 5 bullets, each with the concrete fact from the tools: amounts with $ and the usual amount, the exact emails or domains, the rule that fired.\n' +
+            '### What to do in Preflight\n1. Numbered steps that name Preflight\'s own controls: the payee inbox (Yes / No), "Release and send" after the cooling-off period and a call to the number on file, "Stop this payout", "Acknowledge" for warnings, "Send ... via PayPal".\n' +
+            'Keep each bullet to one line. No preamble, no closing summary.',
           tools: () => [...preflightTools, tools.delegateTo(['lead']), tools.renameThread()],
           maxTurns: 12,
           adapter,
@@ -139,4 +162,9 @@ export function buildPreflightAi(models: string[]): AgAiHarnessSetup {
       promptStarters: PROMPT_STARTERS,
       models: models.length > 1 ? models.map((id) => ({ id, label: id })) : undefined,
     }));
+    cached = { api, harness };
+    currentHarness = harness;
+    harnessListeners.forEach((l) => l(harness));
+    return harness;
+  };
 }

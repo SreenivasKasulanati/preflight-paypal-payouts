@@ -3,10 +3,11 @@
 // The browser's copy of Preflight's state, shared by the host page and every custom AG Studio
 // widget. Widgets read it with useSyncExternalStore, so a change made anywhere redraws everything.
 
+import type { Scenario } from '@/lib/preflight/seed';
 import { useSyncExternalStore } from 'react';
 import type { Snapshot } from '@/lib/preflight/snapshot';
 
-export type InboxMessage = { rowId: string; name: string; token: string; message: string };
+export type InboxMessage = { rowId: string; name: string; token: string; message: string; sms: { phone: string; text: string } | null };
 export type EvalResult = {
   synthetic: true; seed: number; total: number; rules: string[];
   genuine: { n: number; instant: number; warned: number; held: number };
@@ -15,6 +16,10 @@ export type EvalResult = {
 };
 
 type State = {
+  /** The demo scenario loaded into the request box (shown in the demo strip), if any. */
+  scenario: Scenario | null;
+  /** Demo shows the simulation (scenarios, payee inbox and phone); Product shows what a business sees. */
+  view: 'demo' | 'product';
   snapshot: Snapshot | null;
   inbox: InboxMessage[];
   selectedRowId: string | null;
@@ -24,7 +29,7 @@ type State = {
   evaluation: EvalResult | null;
 };
 
-let state: State = { snapshot: null, inbox: [], selectedRowId: null, busy: null, error: null, notice: null, evaluation: null };
+let state: State = { scenario: null, view: 'demo', snapshot: null, inbox: [], selectedRowId: null, busy: null, error: null, notice: null, evaluation: null };
 const listeners = new Set<() => void>();
 const set = (patch: Partial<State>) => {
   state = { ...state, ...patch };
@@ -59,12 +64,12 @@ async function request<T>(method: 'GET' | 'POST', path: string, body?: unknown):
   return data;
 }
 
-async function run(label: string, fn: () => Promise<Snapshot | void>, notice?: string) {
+async function run(label: string, fn: () => Promise<Snapshot | void>, notice?: string | (() => string)) {
   set({ busy: label, error: null, notice: null });
   try {
     const snap = await fn();
     const inbox = await request<InboxMessage[]>('GET', 'inbox');
-    set({ ...(snap ? { snapshot: snap } : {}), inbox, busy: null, notice: notice ?? null });
+    set({ ...(snap ? { snapshot: snap } : {}), inbox, busy: null, notice: (typeof notice === 'function' ? notice() : notice) ?? null });
     return true;
   } catch (e) {
     set({ busy: null, error: e instanceof Error ? e.message : String(e) });
@@ -73,6 +78,8 @@ async function run(label: string, fn: () => Promise<Snapshot | void>, notice?: s
 }
 
 export const actions = {
+  setView: (view: State['view']) => set({ view }),
+  setScenario: (scenario: Scenario | null) => set({ scenario }),
   load: () => run('Loading', () => request<Snapshot>('GET', 'state')),
   runPreflight: (text: string) =>
     run('Reading the request and checking every payout', async () => {
@@ -85,19 +92,39 @@ export const actions = {
   refresh: (reviewId: string) => run('Reading PayPal statuses', () => request<Snapshot>('POST', `reviews/${reviewId}/refresh`)),
   edit: (rowId: string, patch: { amount?: number; receiver?: string; name?: string }) =>
     run('Re-checking the row', () => request<Snapshot>('POST', `items/${rowId}`, { action: 'edit', ...patch })),
+  confirmSender: (reviewId: string) =>
+    run('Confirming the batch', () => request<Snapshot>('POST', `reviews/${reviewId}/confirm-sender`, { confirmed: true }), 'Batch confirmed. Rows with their own holds stay held.'),
+  rejectSender: (reviewId: string) =>
+    run('Stopping the whole batch', () => request<Snapshot>('POST', `reviews/${reviewId}/reject-sender`), 'Fake request stopped. Nothing in it was paid.'),
   acknowledge: (rowId: string) => run('Saving', () => request<Snapshot>('POST', `items/${rowId}`, { action: 'ack' })),
   release: (rowId: string) =>
     run('Releasing after call-back', () => request<Snapshot>('POST', `items/${rowId}`, { action: 'release', calledPayee: true }), 'Released and sent.'),
   stop: (rowId: string) => run('Stopping', () => request<Snapshot>('POST', `items/${rowId}`, { action: 'cancel' }), 'Stopped. Nothing was sent.'),
   pullBack: (rowId: string) => run('Asking PayPal to cancel the unclaimed payout', () => request<Snapshot>('POST', `items/${rowId}`, { action: 'pullback' }), 'Pulled back: PayPal returned the money.'),
-  answer: (token: string, answer: 'yes' | 'no') =>
-    run(
-      answer === 'yes' ? 'Payee confirmed: releasing' : 'Payee denied: stopping',
+  answer: (token: string, answer: 'yes' | 'no') => {
+    let needsCode = false;
+    return run(
+      answer === 'yes' ? 'Payee confirmed by email' : 'Payee denied: stopping',
       async () => {
-        await request('POST', 'verify', { token, answer });
+        needsCode = (await request<{ needsCode?: boolean }>('POST', 'verify', { token, answer })).needsCode === true;
         return request<Snapshot>('GET', 'state');
       },
-      answer === 'yes' ? 'Verified by the payee and sent through PayPal.' : 'The payee said no. Marked as fraud; nothing was sent.',
+      () =>
+        answer === 'no'
+          ? 'The payee said no. Marked as fraud; nothing was sent.'
+          : needsCode
+            ? 'New payout details: a code was texted to the phone on file. Nothing is sent until it is entered.'
+            : 'Verified by the payee and sent through PayPal.',
+    );
+  },
+  enterCode: (token: string, code: string) =>
+    run(
+      'Checking the code',
+      async () => {
+        await request('POST', 'verify', { token, code });
+        return request<Snapshot>('GET', 'state');
+      },
+      'Code matched the phone on file: verified and sent through PayPal.',
     ),
   addRule: async (text: string) => {
     let problem: string | undefined;

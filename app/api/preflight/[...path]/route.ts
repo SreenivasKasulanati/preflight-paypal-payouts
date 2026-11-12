@@ -4,10 +4,12 @@
 //   POST /api/preflight/reviews               { text }  -> extract + check + investigate
 //   POST /api/preflight/reviews/:id/send      send clear + acknowledged rows as one PayPal batch
 //   POST /api/preflight/reviews/:id/refresh   re-read PayPal payout statuses
+//   POST /api/preflight/reviews/:id/confirm-sender  { confirmed } lift the suspicious-sender batch hold
+//   POST /api/preflight/reviews/:id/reject-sender   the sender was fake: stop every unsent row
 //   POST /api/preflight/items/:rowId          { action: edit|ack|release|cancel|pullback, ... }
 //   POST /api/preflight/rules                 { text }  -> compile + backtest (unconfirmed)
 //   POST /api/preflight/rules/:id             { confirmed } | { delete: true }
-//   POST /api/preflight/verify                { token, answer: yes|no }
+//   POST /api/preflight/verify                { token, answer: yes|no } or { token, code } (code texted to the phone on file)
 //   POST /api/preflight/eval                  run the synthetic evaluation
 //   POST /api/preflight/reset                 back to the seed data
 
@@ -15,8 +17,8 @@ import { rateLimited } from '@/lib/rate-limit';
 import { runEvaluation } from '@/lib/preflight/evaluate';
 import { snapshot, inbox } from '@/lib/preflight/snapshot';
 import {
-  PreflightError, acknowledge, answerVerification, confirmRule, createReview, deleteRule, editItem,
-  ownerCancel, ownerRelease, proposeRule, pullBack, refreshReview, sendReview,
+  PreflightError, acknowledge, confirmSender, answerCode, answerVerification, confirmRule, createReview, deleteRule, editItem,
+  ownerCancel, ownerRelease, proposeRule, pullBack, refreshReview, rejectSender, sendReview,
 } from '@/lib/preflight/service';
 import { resetStore } from '@/lib/preflight/store';
 
@@ -53,6 +55,8 @@ export async function POST(request: Request, ctx: Ctx) {
           if (text.length > 50_000) return fail('That request is too long for the demo (50,000 characters max).');
           await createReview({ text });
         } else if (verb === 'send') await sendReview(id);
+        else if (verb === 'confirm-sender') confirmSender(id, b.confirmed === true);
+        else if (verb === 'reject-sender') rejectSender(id);
         else if (verb === 'refresh') await refreshReview(id);
         else return fail('Not found', 404);
         return json(snapshot());
@@ -88,10 +92,16 @@ export async function POST(request: Request, ctx: Ctx) {
         return json(snapshot());
       }
       case 'verify': {
+        if (typeof b.token !== 'string') return fail('Missing token');
+        if (typeof b.code === 'string') {
+          const { item } = await answerCode(b.token, b.code);
+          return json({ ok: true, state: item.state, paypalStatus: item.paypal?.status ?? null, name: item.name });
+        }
         const answer = b.answer === 'yes' ? 'yes' : b.answer === 'no' ? 'no' : null;
-        if (!answer || typeof b.token !== 'string') return fail('Missing answer');
-        const { item } = await answerVerification(b.token, answer);
-        return json({ ok: true, state: item.state, paypalStatus: item.paypal?.status ?? null, name: item.name });
+        if (!answer) return fail('Missing answer');
+        const result = await answerVerification(b.token, answer);
+        const { item } = result;
+        return json({ ok: true, needsCode: 'needsCode' in result, state: item.state, paypalStatus: item.paypal?.status ?? null, name: item.name });
       }
       case 'eval':
         return json(runEvaluation());

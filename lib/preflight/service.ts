@@ -1,12 +1,12 @@
 // What the API routes call. Every state change goes through here and is written to the audit log.
 
-import { randomBytes } from 'node:crypto';
+import { randomBytes, randomInt } from 'node:crypto';
 import { compileRule } from './compile';
 import { emailEvidence, parseEml } from './email';
 import { extractRows } from './extract';
 import { investigate, investigateWithRules } from './investigate';
 import { cancelItem, createBatch, getBatch, payoutsMode, walletFor } from './payouts';
-import { backtest, evaluateItems, usdText } from './rules';
+import { backtest, evaluateItems, senderSuspicious, usdText } from './rules';
 import { ORG } from './seed';
 import { log, store } from './store';
 import type { Review, ReviewItem, Rule } from './types';
@@ -27,7 +27,11 @@ function findItem(rowId: string): { review: Review; item: ReviewItem } {
 const sentStatuses = () =>
   store().reviews.flatMap((r) => r.items.filter((i) => i.paypal).map((i) => ({ receiver: i.receiver, status: i.paypal?.status })));
 
+/** Holds of the row's own, beyond the batch-wide suspicious-sender hold. */
+const ownHold = (item: ReviewItem) => item.findings.some((f) => f.severity === 'hold' && f.code !== 'SENDER_UNVERIFIED');
+
 function holdDetails(item: ReviewItem) {
+  if (!ownHold(item)) return; // held only by the batch: confirming the batch releases it
   const s = store();
   const payee = s.payees.find((p) => p.id === item.payeeId);
   item.coolingUntil = new Date(Date.now() + COOLING_MINUTES * 60_000).toISOString();
@@ -57,6 +61,7 @@ export async function createReview(input: { text: string }) {
     createdAt: new Date().toISOString(),
     source: parsed.hasHeaders ? 'email' : rows[0]?.sourceQuote.includes(',') ? 'csv' : 'text',
     extractedBy: by,
+    senderSuspicious: senderSuspicious(email),
     ...(aiError && { aiNote: `AI was unavailable (${aiError.includes('429') ? 'OpenAI rate limit' : 'error'}), so the code parser read this request.` }),
     email,
     items,
@@ -68,9 +73,10 @@ export async function createReview(input: { text: string }) {
   // The AI investigates held rows only; a warning gets the rules summary, which keeps AI requests
   // (and rate limits) to what matters. Failures fall back to the rules summary too.
   for (const item of items) if (item.state === 'warn') item.investigation = investigateWithRules(item);
+  // Rows held only by the batch-wide sender hold need no case of their own: the banner explains them.
   await Promise.all(
     items
-      .filter((i) => i.state === 'held')
+      .filter((i) => i.state === 'held' && ownHold(i))
       .map(async (item) => {
         try {
           item.investigation = await investigate({ item, payees: s.payees, history: s.history, email, sentStatuses: sentStatuses() });
@@ -91,12 +97,62 @@ export function editItem(rowId: string, patch: Partial<Pick<ReviewItem, 'amount'
   const updated = { ...item, ...patch, receiverSource: patch.receiver ? ('request' as const) : item.receiverSource };
   // An owner edit is the owner's own data, so it counts as verified against the source.
   const source = `${updated.name} ${updated.receiver} ${updated.amount}`;
-  const [checked] = evaluateItems([updated], { rules: s.rules, payees: s.payees, history: s.history, email: review.email, source });
-  Object.assign(item, checked, { investigation: checked.state === 'clear' ? undefined : item.investigation });
+  const [checked] = evaluateItems([updated], {
+    rules: s.rules, payees: s.payees, history: s.history, email: review.email, source, senderConfirmed: !!review.senderConfirmedAt,
+  });
+  // The old case no longer matches the edited row, so it's rebuilt from the new findings (no AI call).
+  // A second payout to the same person in this batch stays flagged after an edit.
+  const dup = item.findings.find((f) => f.code === 'DUPLICATE_IN_BATCH');
+  if (dup && !checked.findings.some((f) => f.code === 'DUPLICATE_IN_BATCH')) {
+    checked.findings.push(dup);
+    if (checked.state === 'clear') checked.state = 'warn';
+  }
+  Object.assign(item, checked, { investigation: checked.state === 'clear' ? undefined : investigateWithRules(checked) });
   if (item.state === 'held' && !item.verifyToken) holdDetails(item);
-  if (item.state !== 'held') Object.assign(item, { coolingUntil: undefined, verifyToken: undefined, verificationDraft: undefined });
+  if (!ownHold(item)) Object.assign(item, { coolingUntil: undefined, verifyToken: undefined, verificationDraft: undefined, phoneCode: undefined });
   log({ reviewId: review.id, rowId, action: 'row_edited', detail: JSON.stringify(patch) });
   return item;
+}
+
+/**
+ * The owner confirmed the batch with the real sender through a trusted channel (a call, in person).
+ * The batch-wide hold lifts; rows with holds of their own (Maria) stay held.
+ */
+export function confirmSender(reviewId: string, confirmed: boolean) {
+  const review = store().reviews.find((r) => r.id === reviewId);
+  if (!review) throw new PreflightError('Unknown review');
+  if (!review.senderSuspicious) throw new PreflightError('This batch has no sender warning.');
+  if (!confirmed) throw new PreflightError('Tick that you confirmed the batch with the real sender first.');
+  review.senderConfirmedAt = new Date().toISOString();
+  for (const item of review.items) {
+    if (item.state !== 'held' && item.state !== 'warn' && item.state !== 'clear') continue;
+    item.findings = item.findings.filter((f) => f.code !== 'SENDER_UNVERIFIED');
+    item.state = item.findings.some((f) => f.severity === 'hold') ? 'held' : item.findings.some((f) => f.severity === 'warn') ? 'warn' : 'clear';
+    if (item.state !== 'held') item.investigation = item.state === 'clear' ? undefined : investigateWithRules(item);
+  }
+  log({ reviewId, action: 'batch_confirmed_with_sender', detail: 'owner confirmed through a trusted channel; batch-wide hold lifted' });
+  return review;
+}
+
+/**
+ * The owner checked with the real sender and they did not send this request: every row that
+ * hasn't gone out is stopped as fraud, including the normal-looking ones (they came from the
+ * same fake email). Real payouts to those people go through a genuine request.
+ */
+export function rejectSender(reviewId: string) {
+  const review = store().reviews.find((r) => r.id === reviewId);
+  if (!review) throw new PreflightError('Unknown review');
+  if (!review.senderSuspicious) throw new PreflightError('This batch has no sender warning.');
+  if (review.senderConfirmedAt) throw new PreflightError('This batch was already confirmed with the sender.');
+  let stopped = 0;
+  for (const item of review.items) {
+    if (item.state === 'sent' || item.state === 'denied') continue;
+    Object.assign(item, { state: 'denied', verifyToken: undefined, phoneCode: undefined, coolingUntil: undefined });
+    stopped++;
+  }
+  review.senderRejectedAt = new Date().toISOString();
+  log({ reviewId, action: 'batch_rejected_fake_sender', detail: `the real sender did not send it; ${stopped} payouts stopped, nothing sent` });
+  return review;
 }
 
 export function acknowledge(rowId: string) {
@@ -161,32 +217,69 @@ export async function answerVerification(token: string, answer: 'yes' | 'no') {
     const item = review.items.find((i) => i.verifyToken === token);
     if (!item) continue;
     if (item.state !== 'held') throw new PreflightError('This request was already answered.');
-    item.verifyToken = undefined;
     if (answer === 'no') {
-      item.state = 'denied';
+      Object.assign(item, { state: 'denied', verifyToken: undefined, phoneCode: undefined });
       log({ reviewId: review.id, rowId: item.rowId, action: 'payee_denied', detail: `${item.name} said they did not request ${item.receiver}` });
       return { item, review };
     }
     const payee = s.payees.find((p) => p.id === item.payeeId);
-    if (payee) {
-      // Verified once: the new details become the trusted ones, so next time goes straight through.
-      payee.email = item.receiver;
-      payee.wallet = item.wallet;
-      payee.trusted = true;
+    // New payout details: a "Yes" from the mailbox isn't enough, because the mailbox may be what's
+    // hacked. A code goes by text to the phone on file, and only the code releases the payout.
+    if (payee && payee.email.toLowerCase() !== item.receiver.toLowerCase()) {
+      if (!item.phoneCode) {
+        item.phoneCode = String(randomInt(100000, 1000000));
+        item.phoneCodeTries = 0;
+        log({ reviewId: review.id, rowId: item.rowId, action: 'code_texted', detail: `email said yes; code texted to ${payee.phoneOnFile}` });
+      }
+      return { item, review, needsCode: true };
     }
-    item.releasedBy = 'payee';
-    log({ reviewId: review.id, rowId: item.rowId, action: 'payee_verified', detail: `${item.name} confirmed ${item.receiver}` });
-    await sendItems(review, [item], 'verified by payee');
-    await refreshReview(review.id);
-    return { item, review };
+    return { item, review, ...(await releaseVerified(review, item)) };
   }
   throw new PreflightError('This link is not valid or has expired.');
+}
+
+/** Step two: the code texted to the phone on file. Three wrong codes stop the payout as fraud. */
+export async function answerCode(token: string, code: string) {
+  const s = store();
+  for (const review of s.reviews) {
+    const item = review.items.find((i) => i.verifyToken === token);
+    if (!item) continue;
+    if (item.state !== 'held' || !item.phoneCode) throw new PreflightError('No code is waiting for this payout.');
+    if (code.trim() !== item.phoneCode) {
+      item.phoneCodeTries = (item.phoneCodeTries ?? 0) + 1;
+      if (item.phoneCodeTries >= 3) {
+        Object.assign(item, { state: 'denied', verifyToken: undefined, phoneCode: undefined });
+        log({ reviewId: review.id, rowId: item.rowId, action: 'code_failed', detail: '3 wrong codes: stopped as fraud' });
+        throw new PreflightError('Three wrong codes. The payout is stopped as fraud and nothing was sent.');
+      }
+      throw new PreflightError(`That code is wrong. ${3 - item.phoneCodeTries} tries left.`);
+    }
+    log({ reviewId: review.id, rowId: item.rowId, action: 'code_confirmed', detail: 'code from the phone on file matched' });
+    return { item, review, ...(await releaseVerified(review, item)) };
+  }
+  throw new PreflightError('This link is not valid or has expired.');
+}
+
+async function releaseVerified(review: Review, item: ReviewItem) {
+  const payee = store().payees.find((p) => p.id === item.payeeId);
+  if (payee) {
+    // Verified once: the new details become the trusted ones, so next time goes straight through.
+    payee.email = item.receiver;
+    payee.wallet = item.wallet;
+    payee.trusted = true;
+  }
+  Object.assign(item, { releasedBy: 'payee', verifyToken: undefined, phoneCode: undefined });
+  log({ reviewId: review.id, rowId: item.rowId, action: 'payee_verified', detail: `${item.name} confirmed ${item.receiver}` });
+  await sendItems(review, [item], 'verified by payee');
+  await refreshReview(review.id);
+  return { sent: true };
 }
 
 /** The owner releases a held row after the cooling-off period, having called the number on file. */
 export async function ownerRelease(rowId: string, calledPayee: boolean) {
   const { review, item } = findItem(rowId);
   if (item.state !== 'held') throw new PreflightError('Only held rows can be released.');
+  if (!ownHold(item)) throw new PreflightError('Confirm the batch with the real sender first (the red banner above the grid).');
   if (!calledPayee) throw new PreflightError('Confirm you called the payee on the number on file first.');
   if (item.coolingUntil && Date.parse(item.coolingUntil) > Date.now()) {
     throw new PreflightError(`Cooling-off ends at ${new Date(item.coolingUntil).toLocaleTimeString('en-US')}. Payee verification can release it sooner.`);

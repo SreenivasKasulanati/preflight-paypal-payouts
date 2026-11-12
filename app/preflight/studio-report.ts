@@ -24,10 +24,11 @@ const review = page({
     sender: { type: 'pf-sender', dataMapping: {}, format: {} },
   },
   widgetLayout: {
-    scoreboard: at(0, 0, 24, 7),
-    grid: at(0, 7, 24, 26),
-    case: at(0, 33, 14, 22),
-    sender: at(14, 33, 10, 22),
+    // 59 rows in all (fit.ts sizes each row so the page fills the window).
+    scoreboard: at(0, 0, 24, 8),
+    grid: at(0, 8, 24, 35),
+    case: at(0, 43, 14, 16),
+    sender: at(14, 43, 10, 16),
   },
 });
 
@@ -36,31 +37,37 @@ const controlRoom = page({
   widgets: {
     'by-state': {
       type: 'column-chart-stacked',
-      dataMapping: { categoryKey: [{ id: 'payouts.state' }], valueKey: [sum('payouts.amount')], legendKey: [{ id: 'payouts.wallet' }] },
-      format: title('Dollars by Preflight state'),
+      dataMapping: { categoryKey: [{ id: 'payouts.state' }], valueKey: [sum('payouts.amount')], legendKey: [{ id: 'payouts.state' }] },
+      format: {
+        ...title('Payout dollars by Preflight state'),
+        style: { theme: { bar: { series: { label: { enabled: true } } }, common: { legend: { enabled: false } } }, custom: { categoryAxis: { gridLine: { enabled: false } } } },
+      },
     },
     'by-signal': {
       type: 'donut-chart',
-      dataMapping: { categoryKey: [{ id: 'findings.rule' }], valueKey: [countd('findings.id')] },
-      format: title('What triggered holds and warnings'),
+      dataMapping: { categoryKey: [{ id: 'findings.signal' }], valueKey: [countd('findings.id')] },
+      format: { ...title('What triggered holds and warnings'), style: { theme: { common: { legend: { enabled: true, position: 'bottom' } } } } },
     },
     'weekly-history': {
       type: 'column-chart-stacked',
       dataMapping: { categoryKey: [{ id: 'calendar::week' }], valueKey: [sum('history.amount')], legendKey: [{ id: 'history.payee' }] },
-      format: title('Payouts sent per week, by payee'),
+      format: {
+        ...title('Payouts sent per week, by payee'),
+        style: { theme: { common: { legend: { enabled: true, position: 'bottom' } } }, custom: { categoryAxis: { gridLine: { enabled: false } } } },
+      },
     },
     safety: { type: 'pf-safety-test', dataMapping: {}, format: {} },
     rules: { type: 'pf-rules', dataMapping: {}, format: {} },
     payees: {
       type: 'grid',
       dataMapping: {
-        cols: [{ id: 'payees.payee' }, { id: 'payees.email' }, { id: 'payees.wallet' }, { id: 'payees.trusted' }, sum('payees.usualAmount'), sum('payees.payouts')],
+        cols: [{ id: 'payees.payee' }, { id: 'payees.email' }, { id: 'payees.trusted' }, { id: 'payees.usualPay' }],
       },
       format: title('Payees and trust'),
     },
     findings: {
       type: 'grid',
-      dataMapping: { cols: [{ id: 'findings.payee' }, { id: 'findings.severity' }, { id: 'findings.rule' }, { id: 'findings.message' }] },
+      dataMapping: { cols: [{ id: 'findings.payee' }, { id: 'findings.severity' }, { id: 'findings.signal' }, { id: 'findings.message' }] },
       format: title('Every signal, with its source'),
     },
   },

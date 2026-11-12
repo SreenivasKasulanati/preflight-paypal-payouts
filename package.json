@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test:engine": "tsx scripts/engine-check.ts"
+    "test:engine": "tsx scripts/engine-check.ts && tsx scripts/flow-check.ts"
   },
   "dependencies": {
     "ag-grid-community": "36.2.0",
